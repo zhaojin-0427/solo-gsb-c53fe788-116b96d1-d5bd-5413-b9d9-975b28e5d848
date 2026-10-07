@@ -24,6 +24,27 @@ _BUSY_TIMEOUT_MS = 5000
 _BUSY_ATTEMPTS = 60
 _BUSY_WAIT_SECONDS = 0.05
 
+#: Two stored-plan threshold confirmations within this distance count as equal.
+_THRESHOLD_TOL = 1e-9
+
+
+class BatchRejected(Exception):
+    """A batch-creation request refused against the AUTHORITATIVE scenario row.
+
+    Raised inside the same ``BEGIN IMMEDIATE`` transaction that would insert
+    the batch, so the refusal is decided on the committed state visible at
+    write time (never on a snapshot taken before the transaction).  ``status_code``
+    is the HTTP status the route must return and ``fields`` are merged into
+    the response ``detail`` object; raising rolls the transaction back, so a
+    refusal never leaves a batch behind.
+    """
+
+    def __init__(self, status_code: int, reason: str, fields: dict | None = None):
+        self.status_code = status_code
+        self.reason = reason
+        self.fields = fields or {}
+        super().__init__(f"batch creation rejected: {reason}")
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS scenarios (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -298,29 +319,133 @@ class Store:
     # Execution batches (frozen plan) and actual-take-off reports
     # ------------------------------------------------------------------
 
-    def create_batch(self, scenario_id: int, name: str, input_payload: dict,
+    def create_batch(self, scenario_id: int, name: str,
+                     use_stored_plan: bool = False,
+                     confirmed_radius: float | None = None,
+                     confirmed_height: float | None = None) -> int:
+        """Create a batch after arbitrating against the in-transaction row.
+
+        The whole decision - read the authoritative scenario state, judge it,
+        freeze its snapshot/thresholds/plan and insert the batch - happens in
+        ONE ``BEGIN IMMEDIATE`` transaction.  Reading the feasible table, the
+        ``unknown`` marker and the stored thresholds only after acquiring the
+        write lock is what makes batch creation correct when another *process*
+        sharing this SQLite file commits a solve in the gap a request would
+        otherwise have used to pre-read that state:
+
+        * if the latest solve is ``unknown`` (persisted marker) while an OLD
+          feasible table is retained, the batch is created ONLY with an
+          explicit ``use_stored_plan`` selection AND a confirmation matching
+          the old table's ORIGINAL thresholds - a marker committed first can
+          therefore never be passed on a stale pre-transaction read;
+        * if a new VERIFIED solve (feasible, or a proven infeasibility)
+          commits first, its own snapshot/thresholds/plan are what gets read
+          and frozen, so a stale old table can never be frozen on a
+          pre-transaction read.
+
+        Every refusal raises :class:`BatchRejected`, which rolls the
+        transaction back, so no batch is left behind.
+        """
+        with self._write_tx() as c:
+            row = c.execute(
+                "SELECT input_json,safety_radius,safety_height,result_json,"
+                "latest_solve_status FROM scenarios WHERE id=?",
+                (scenario_id,)).fetchone()
+            if row is None:
+                raise BatchRejected(404, "scenario_not_found")
+            result = json.loads(row["result_json"]) if row["result_json"] else None
+            if result is None or not result.get("feasible"):
+                # No feasible table at the authoritative moment - neither a
+                # plain missing result nor a freshly committed proven
+                # infeasibility may create a batch.
+                raise BatchRejected(
+                    400, "no_feasible_plan",
+                    {"message": "a feasible plan must be solved before creating "
+                                "an execution batch"})
+            old_R, old_H = row["safety_radius"], row["safety_height"]
+            if row["latest_solve_status"] == "unknown":
+                # The retained feasible table is an UNVERIFIED old table: the
+                # new locks/thresholds of the latest run proved nothing.  Only
+                # an explicit, threshold-checked selection may freeze it.
+                if not use_stored_plan:
+                    raise BatchRejected(409, "latest_solve_unverified", {
+                        "scenario_id": scenario_id,
+                        "latest_solve_status": "unknown",
+                        "stored_plan_original_safety_radius": old_R,
+                        "stored_plan_original_safety_height": old_H,
+                        "message": "the most recent solve returned unknown; the "
+                                   "stored feasible table is an unverified OLD "
+                                   "table. Re-solve successfully first, or "
+                                   "explicitly select it with use_stored_plan="
+                                   "true and confirm its original thresholds",
+                    })
+                if confirmed_radius is None or confirmed_height is None:
+                    raise BatchRejected(
+                        409, "stored_plan_threshold_confirmation_required", {
+                            "scenario_id": scenario_id,
+                            "stored_plan_original_safety_radius": old_R,
+                            "stored_plan_original_safety_height": old_H,
+                        })
+                if (abs(float(confirmed_radius) - float(old_R)) > _THRESHOLD_TOL
+                        or abs(float(confirmed_height) - float(old_H))
+                        > _THRESHOLD_TOL):
+                    raise BatchRejected(409, "stored_plan_threshold_mismatch", {
+                        "scenario_id": scenario_id,
+                        "stored_plan_original_safety_radius": old_R,
+                        "stored_plan_original_safety_height": old_H,
+                        "confirmed_safety_radius": confirmed_radius,
+                        "confirmed_safety_height": confirmed_height,
+                    })
+            # The frozen values come from the SAME authoritative row the
+            # decision was made on; a solve committed after this point blocks
+            # on our write lock and a later request arbitrates against it
+            # afresh.
+            input_payload = json.loads(row["input_json"])
+            plan = {"offsets": dict(result["offsets"])}
+            return self._insert_batch_locked(
+                c, scenario_id, name, input_payload, old_R, old_H, plan)
+
+    @staticmethod
+    def _insert_batch_locked(c, scenario_id: int, name: str,
+                             input_payload: dict, safety_radius: float,
+                             safety_height: float, plan: dict,
+                             now: float | None = None) -> int:
+        """Insert a batch row + baseline node on an open write transaction."""
+        if now is None:
+            now = time.time()
+        cur = c.execute(
+            "INSERT INTO batches(scenario_id,name,input_json,safety_radius,"
+            "safety_height,plan_json,created_at) VALUES (?,?,?,?,?,?,?)",
+            (scenario_id, name, json.dumps(input_payload, ensure_ascii=False),
+             float(safety_radius), float(safety_height),
+             json.dumps(plan, ensure_ascii=False), now),
+        )
+        bid = int(cur.lastrowid)
+        # Baseline node (seq 1): the empty report state before any accepted
+        # write. Created in the same transaction as the batch, so every batch
+        # always has a replay chain starting at seq 1.
+        c.execute(
+            "INSERT INTO batch_report_nodes"
+            "(batch_id,seq,trigger_sortie_id,trigger_actual_offset,"
+            "trigger_revision,before_json,after_json,created_at) "
+            "VALUES (?,1,NULL,NULL,NULL,'[]','[]',?)",
+            (bid, now))
+        return bid
+
+    def insert_batch(self, scenario_id: int, name: str, input_payload: dict,
                      safety_radius: float, safety_height: float,
                      plan: dict) -> int:
+        """Freeze an EXPLICIT snapshot/thresholds/plan into a new batch.
+
+        Low-level entry point bypassing the feasible-plan/unknown-marker
+        adjudication (which the HTTP route performs atomically in
+        :meth:`create_batch`); used when the caller already owns the exact
+        values to freeze (and by the storage-level report tests).
+        """
         with self._write_tx() as c:
-            now = time.time()
-            cur = c.execute(
-                "INSERT INTO batches(scenario_id,name,input_json,safety_radius,"
-                "safety_height,plan_json,created_at) VALUES (?,?,?,?,?,?,?)",
-                (scenario_id, name, json.dumps(input_payload, ensure_ascii=False),
-                 float(safety_radius), float(safety_height),
-                 json.dumps(plan, ensure_ascii=False), now),
-            )
-            bid = int(cur.lastrowid)
-            # Baseline node (seq 1): the empty report state before any
-            # accepted write. Created in the same transaction as the batch,
-            # so every batch always has a replay chain starting at seq 1.
-            c.execute(
-                "INSERT INTO batch_report_nodes"
-                "(batch_id,seq,trigger_sortie_id,trigger_actual_offset,"
-                "trigger_revision,before_json,after_json,created_at) "
-                "VALUES (?,1,NULL,NULL,NULL,'[]','[]',?)",
-                (bid, now))
-            return bid
+            return self._insert_batch_locked(
+                c, scenario_id, name, input_payload,
+                safety_radius, safety_height, plan)
 
     def list_batches(self, scenario_id: int | None = None) -> list[dict]:
         sql = ("SELECT b.id,b.scenario_id,b.name,b.safety_radius,b.safety_height,"

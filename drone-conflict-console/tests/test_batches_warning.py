@@ -118,7 +118,7 @@ def test_store_revision_protocol():
     with tempfile.TemporaryDirectory() as d:
         store = Store(os.path.join(d, "t.db"))
         sid = store.create_scenario({"sorties": []}, 30, 10)
-        bid = store.create_batch(sid, "b", {"sorties": [{"id": "A"}, {"id": "B"}]},
+        bid = store.insert_batch(sid, "b", {"sorties": [{"id": "A"}, {"id": "B"}]},
                                  30, 10, {"offsets": {"A": 1, "B": 2}})
 
         outcome, _ = store.submit_report(bid, "A", 5, 2)
@@ -151,7 +151,7 @@ def test_concurrent_keeps_highest():
         store = Store(os.path.join(d, "t.db"))
         sid = store.create_scenario({"sorties": []}, 30, 10)
         for trial in range(20):
-            bid = store.create_batch(sid, f"b{trial}", {"sorties": [{"id": "A"}]},
+            bid = store.insert_batch(sid, f"b{trial}", {"sorties": [{"id": "A"}]},
                                      30, 10, {"offsets": {"A": 0}})
             outcomes = []
             lock = threading.Lock()
@@ -217,7 +217,7 @@ def test_multiprocess_shared_db():
 
         # --- revision 3 vs 2 on top of an existing revision 1 ---------------
         for trial in range(10):
-            bid = setup.create_batch(
+            bid = setup.insert_batch(
                 sid, f"race{trial}", {"sorties": [{"id": "A"}]},
                 30, 10, {"offsets": {"A": 0}})
             outcome, _ = setup.submit_report(bid, "A", 10, 1)
@@ -245,7 +245,7 @@ def test_multiprocess_shared_db():
 
         # --- concurrent first reports, same revision 1 ----------------------
         # Same value: one insert + one idempotent, exactly one row.
-        bid = setup.create_batch(
+        bid = setup.insert_batch(
             sid, "first-same", {"sorties": [{"id": "A"}]},
             30, 10, {"offsets": {"A": 0}})
         results = race(bid, [(1, 5), (1, 5)])
@@ -258,7 +258,7 @@ def test_multiprocess_shared_db():
               "single row after concurrent identical first reports")
 
         # Different values: one insert + one same-revision value conflict.
-        bid = setup.create_batch(
+        bid = setup.insert_batch(
             sid, "first-diff", {"sorties": [{"id": "A"}]},
             30, 10, {"offsets": {"A": 0}})
         results = race(bid, [(1, 5), (1, 6)])
@@ -274,7 +274,7 @@ def test_reload_consistency():
     with tempfile.TemporaryDirectory() as d:
         store = Store(os.path.join(d, "t.db"))
         store.create_scenario({"sorties": []}, 30, 10)
-        bid = store.create_batch(1, "b", {"sorties": []}, 30, 10,
+        bid = store.insert_batch(1, "b", {"sorties": []}, 30, 10,
                                  {"offsets": {"A": 0, "B": 10}})
         store.submit_report(bid, "A", 0, 1)
         store.submit_report(bid, "B", 0, 1)
@@ -301,7 +301,7 @@ def test_report_nodes_and_review():
     with tempfile.TemporaryDirectory() as d:
         store = Store(os.path.join(d, "t.db"))
         sid = store.create_scenario({"sorties": []}, 30, 10)
-        bid = store.create_batch(sid, "b", {"sorties": [{"id": "A"}, {"id": "B"}]},
+        bid = store.insert_batch(sid, "b", {"sorties": [{"id": "A"}, {"id": "B"}]},
                                  30, 10, {"offsets": plan})
         nodes = store.list_report_nodes(bid)
         check(len(nodes) == 1 and nodes[0]["is_baseline"]
@@ -604,7 +604,7 @@ def test_concurrent_nodes_follow_commit_order():
     with tempfile.TemporaryDirectory() as d:
         store = Store(os.path.join(d, "t.db"))
         sid = store.create_scenario({"sorties": []}, 30, 10)
-        bid = store.create_batch(sid, "seq", {"sorties": [{"id": "A"}]},
+        bid = store.insert_batch(sid, "seq", {"sorties": [{"id": "A"}]},
                                  30, 10, {"offsets": {"A": 0}})
         # Strictly increasing submissions: every write accepted, node chain
         # reproduces the whole history in commit order.
@@ -627,7 +627,7 @@ def test_concurrent_nodes_follow_commit_order():
         # exactly one node in commit order; rejected stale writes get none;
         # the chain always replays to the highest committed revision.
         for trial in range(10):
-            bid = store.create_batch(sid, f"b{trial}", {"sorties": [{"id": "A"}]},
+            bid = store.insert_batch(sid, f"b{trial}", {"sorties": [{"id": "A"}]},
                                      30, 10, {"offsets": {"A": 0}})
             barrier = threading.Barrier(8)
             results = []
@@ -678,7 +678,7 @@ def test_concurrent_nodes_follow_commit_order():
         setup = Store(path)
         sid = setup.create_scenario({"sorties": []}, 30, 10)
         for trial in range(8):
-            bid = setup.create_batch(sid, f"mp{trial}", {"sorties": [{"id": "A"}]},
+            bid = setup.insert_batch(sid, f"mp{trial}", {"sorties": [{"id": "A"}]},
                                      30, 10, {"offsets": {"A": 0}})
             setup.submit_report(bid, "A", 10, 1)
             barrier = ctx.Barrier(2)

@@ -368,7 +368,7 @@ def test_revision_and_reload_consistency():
     with tempfile.TemporaryDirectory() as d:
         store = Store(os.path.join(d, "t.db"))
         sid = store.create_scenario({"sorties": []}, 30, 10)
-        bid = store.create_batch(sid, "b", {"sorties": [{"id": "A"}]},
+        bid = store.insert_batch(sid, "b", {"sorties": [{"id": "A"}]},
                                  30, 10, {"offsets": {"A": 0}})
         # Deviation: A actually takes off at 2 -> occupancy shifts to [6,8].
         store.submit_report(bid, "A", 2, 1)
