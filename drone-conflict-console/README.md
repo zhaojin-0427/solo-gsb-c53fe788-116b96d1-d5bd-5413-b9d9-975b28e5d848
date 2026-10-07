@@ -118,8 +118,9 @@ drone-conflict-console/
 ├── examples/crossroads.json
 ├── examples/endpoint_meet.json  # 两架次仅在航段端点同一时刻相遇（瞬时冲突复盘演练）
 ├── scripts/
-│   └── verify_multiprocess.py  # 双进程共库并发上报的 HTTP 级验证脚本
+│   └── verify_multiprocess.py  # 双进程共库并发上报 + “建批次↔重算”交错的 HTTP 级验证脚本
 ├── tests/               # 几何交叉验证 + 求解器暴力验证 + 批次/预警语义
+├── tests/test_batch_solve_race.py  # 建批次与 save_result/mark_solve_unknown 跨进程交错的 A/B 与真竞争
 ├── requirements.txt
 ├── Dockerfile
 └── docker-compose.yml
@@ -205,10 +206,10 @@ docker compose down          # 保留数据
 docker compose down -v       # 同时删除已保存数据
 ```
 
-### 双进程共用同一数据库（验证并发上报）
+### 双进程共用同一数据库（验证并发上报与“建批次 ↔ 重算”交错）
 
 默认 `docker compose up` 只启动一个服务进程。若要验证**两个进程同时读写同一份
-SQLite**（例如多副本部署或多 worker）时的修订裁决，可加 `multiproc` profile
+SQLite**（例如多副本部署或多 worker）时的裁决，可加 `multiproc` profile
 额外启动第二个进程 `web2`：它挂载同一个 `dcc-data` 卷、使用同一个
 `DCC_DB_PATH=/data/console.db`，对外暴露在 **8001** 端口：
 
@@ -218,8 +219,14 @@ docker compose --profile multiproc up --build
 # 进程 2 -> http://localhost:8001   （同一个文件）
 ```
 
+`web2` 额外设置 `DCC_GUARDED_BATCH_DELAY=0.15`：仅用于让该进程的建批次写入在**开启
+写事务之前**停顿 0.15 秒（见下文“建批次与并发重算的事务内裁决”）。它不改变裁决本身
+（停顿发生在写锁之外），只是因为建批次是几条很快的 SQL、若不加节拍几乎总是先于需要
+启动求解器的 `POST .../solve` 提交，HTTP 级对拍就永远观察不到“重算先提交”这一交错。
+正常单进程启动（`docker compose up`）不设置该变量、无任何停顿。
+
 然后在宿主机（装有 Python 3 即可，仅用标准库）运行验证脚本，它会分别向
-8000 / 8001 两个进程并发提交上报，并交叉核对批次详情、预警与**复盘节点**：
+8000 / 8001 两个进程并发提交请求，并交叉核对批次详情、预警与**复盘节点**：
 
 ```bash
 python3 scripts/verify_multiprocess.py
@@ -233,6 +240,21 @@ python3 scripts/verify_multiprocess.py
 看来完全一致**——只有已接受的写入产生节点、被拒的旧号不产生、节点顺序即实际
 提交顺序、任一进程/重复加载对同一节点同一 `t` 的复盘结果逐字节相同、未知节点
 返回 404。
+
+脚本还对拍**建批次与并发重算的交错**（批次请求与 `/solve` 请求在同一瞬间分别发往
+两个进程，逐轮换发往 8000/8001，因此“批次先提交”和“重算先提交”两种真实顺序都会
+出现并被分别核对）：
+
+- 批次 vs 超时 `unknown`（保留旧表）：批次先提交时 `201` 冻结旧表 30/10，且之后
+  不带标志的建批次被 `409 latest_solve_unverified` 拒绝、显式 `use_stored_plan=true`
+  + 原阈值 30/10 仍可 `201`；unknown 标记先提交时，不带标志的批次**必须**被 `409`
+  拒绝且**不留批次**，把确认值误填成新阈值 45/12 则 `stored_plan_threshold_mismatch`；
+  绝不能出现“标记先落库、未选旧表的请求仍 201”的过期放行。
+- 批次 vs 新的**可行**重算（锁定 UAV-B=5，偏移变为 {A:4,B:5,C:10,D:11}）与批次 vs
+  **改阈值**的可行重算（R/H 放宽到 15/5，偏移变为全 0）：无论谁先提交，冻结的批次
+  必须是**同一次事务内读取的一整套快照**——旧偏移只配旧阈值、新偏移只配新阈值，
+  绝不允许混合冻结；且批次在两个进程看来完全一致。
+
 结束后 `docker compose --profile multiproc down` 停止两个进程。
 
 ---
@@ -525,6 +547,37 @@ curl -i -X PUT http://localhost:8000/api/batches/1/reports \
 两次请求结束后，`GET /api/batches/{id}` 批次详情、页面（`/app`）与
 `GET .../warning` 预警都只读取这一条最高修订对应的实际偏移。数据库以 WAL 打开，
 并设置了 `busy_timeout`，第二个进程与首个进程同时初始化时会在锁上重试。
+
+#### 建批次与并发重算的事务内裁决
+
+`POST /api/scenarios/{id}/batches` 的资格判定同样**不能**用“先在事务外读旧表/标记、
+再另开事务插入批次”的两段式做法——多个进程共库时，两次事务之间存在间隙，另一进程的
+`POST .../solve` 可能恰好把新状态提交进去，而建批次请求仍按事务外读到的旧快照裁决：
+
+- 间隙里另一进程对新锁定/新阈值重算返回 `unknown` 并**提交未验证标记**：按事务外
+  读到的“无标记可行旧表”，未选旧表的请求会错误地 `201`，把未经验证的表冻成批次
+  （错放行）；
+- 间隙里另一进程先提交了**新的可行解**（或确证无解）：批次仍按事务外读到的旧偏移/
+  旧阈值冻结，冻的是已失效旧表（错冻旧表）。
+
+修复后，**权威状态读取、unknown 标记与旧表原阈值的确认、输入/阈值/计划快照写入与
+批次插入全部绑定在同一个 `BEGIN IMMEDIATE` 写事务内**（存储层
+`create_guarded_batch`）。进程间由 SQLite 写锁串行化，`save_result`（可行/确证无解）
+与 `mark_solve_unknown`（unknown 标记）相对批次事务只能“严格先于”或“严格后于”提交：
+
+- **unknown 先提交**：批次事务内读得到标记。仅当显式 `use_stored_plan=true` **且**
+  确认的 `confirmed_safety_radius/height` 与库中旧表冻结的**原阈值逐一致**才 `201`
+  冻结该旧快照；不带标志/`false`/缺确认/阈值不符一律 `409`（原因码不变）且插入随
+  事务回滚、**不留批次**；
+- **批次先提交**：它保留当时有效的快照（旧表、原阈值），随后才落下的 unknown 标记
+  只约束**之后**的建批次请求；
+- **新可行解先提交**：事务内读到的是新表，批次冻结**新**偏移与**新**阈值（二者来自
+  同一次读取，绝不可能出现“新偏移配旧阈值/旧偏移配新阈值”的混合冻结）；新可行解后于
+  批次提交则不影响已冻快照。
+
+确证无解（`infeasible`）、从无可行旧表、场景不存在的规则不变（分别 `400` / `400` /
+`404`，纯文本响应体不变）；改名/保存旧表不解除标记。页面与直连 API 走同一存储事务，
+状态码、响应字段与已建批次保持不变；已冻结批次不随后续任何重算改变。
 
 ### 3) 评估预警（含拒绝、逾期、不完整标记）
 
@@ -859,6 +912,7 @@ python tests/test_geometry_crossval.py     # 几何：解析法 vs 连续扫描 
 python tests/test_solver_bruteforce.py 2026  # 求解器：对照暴力枚举（含无解核极小性）
 python tests/test_solver_stages.py         # 分阶段见证/超时回退：UNKNOWN 不丢可行表、FEASIBLE 字典序轮不锁未证偏移、全 OPTIMAL 才 optimal、unknown≠infeasible
 python tests/test_solve_keeps_plan.py      # 路由/SQLite：超时 unknown 如实上报且旧表经 prior_solution（附原阈值）保留、unknown 持久标记（重启/GET/改名不解除）、批次须显式选用旧表且确认原阈值否则 409 不建批次；可行重算清标记，infeasible 照常落库
+python tests/test_batch_solve_race.py     # 建批次与重算的跨进程交错：unknown 先提交时未选旧表必 409（旧两段式读法会错放行）、新可行解先提交时冻结新表（旧读法会错冻旧表）、批次先提交保留当时快照、裸 unknown 仍 400；含真竞争多轮
 python tests/test_batches_warning.py       # 批次：修订协议/多进程共库并发/预警分类与冲突/复盘节点与区间差分
 python tests/test_workzone_window.py       # 作业区：圆柱占用解析几何 vs 密采样/闭区间相切/逾期与拒绝/安全窗口
 ```
@@ -918,4 +972,13 @@ python tests/test_workzone_window.py       # 作业区：圆柱占用解析几�
   设置了忙等待，上报用条件写入仲裁，并发修订不会回退（可用
   `docker compose --profile multiproc up` 起两个进程并运行
   `scripts/verify_multiprocess.py` 验证）。复盘节点与上报写在同一事务内提交，
-  因此共库并发时节点与写入原子对应、按实际提交顺序复盘，重载结果一致。
+  因此共库并发时节点与写入原子对应、按实际提交顺序复盘，重载结果一致。**建批次
+  同样在单个 `BEGIN IMMEDIATE` 事务内读取权威状态并写入快照**：与并发
+  `POST .../solve`（`save_result` / `mark_solve_unknown`）交错时，unknown 先提交则
+  只有显式选用旧表且确认原阈值才放行、其余 `409` 且不留批次，批次先提交则保留
+  当时有效快照，新可行解先提交则冻结新表新阈值（绝不混合冻结）——不存在“事务外读
+  旧状态、另起事务插入”的过期裁决窗口（见
+  `tests/test_batch_solve_race.py` 的跨进程 A/B 与真竞争用例）。
+- `DCC_GUARDED_BATCH_DELAY`（秒，默认 0/不设置）**仅用于并发核对**：让某进程的建批次
+  在开启写事务前短暂停顿，使 HTTP 级对拍能稳定观察到“重算先提交”的交错；它作用于写锁
+  之外、不改变裁决，生产与普通单进程部署不要设置。

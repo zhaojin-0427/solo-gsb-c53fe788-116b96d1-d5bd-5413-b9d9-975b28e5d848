@@ -27,7 +27,7 @@ from .solver import (
 )
 from .batch import EarlyTimeReject, Report, evaluate_warning, review_warning
 from .workzone import InvalidWorkZoneQuery, evaluate_workzone
-from .storage import Store
+from .storage import BatchCreateRejected, Store
 
 DB_PATH = os.environ.get("DCC_DB_PATH", "data/console.db")
 store: Store | None = None
@@ -299,16 +299,24 @@ def _batch_summary(row: dict) -> dict:
 
 @app.post("/api/scenarios/{sid}/batches", status_code=201)
 def create_batch(sid: int, req: CreateBatchRequest):
-    row = store.get_scenario(sid)
-    if row is None:
-        raise HTTPException(404, "scenario not found")
-    result = row["result"]
-    if result is None or not result.get("feasible"):
-        raise HTTPException(
-            400, "a feasible plan must be solved before creating an execution batch")
-    # Freeze the input snapshot, safety thresholds and planned offsets; later
-    # re-solves of the scenario never mutate this batch.  The batch always
-    # freezes the plan stored in SQLite, but two situations are distinguished:
+    # The eligibility read, the unknown-marker / original-threshold decision,
+    # the snapshot freeze and the batch INSERT happen in ONE SQLite
+    # ``BEGIN IMMEDIATE`` transaction (``create_guarded_batch``).  Reading the
+    # scenario OUTSIDE a write txn and inserting in a later txn left a gap in
+    # which a concurrent POST .../solve from another process could commit a
+    # state change the batch decision never saw:
+    #
+    # * an ``unknown`` run committing the marker in that gap made a request
+    #   that had read the still-unmarked feasible old table return 201 with an
+    #   unverified table (wrong release);
+    # * a new verified feasible solve committing in that gap made the batch
+    #   freeze the stale old offsets/thresholds read before it (wrong freeze).
+    #
+    # The authoritative state is now read INSIDE the write lock, so solve
+    # writes (``save_result`` / ``mark_solve_unknown``) serialise against the
+    # batch transaction: whoever commits first is exactly what the other
+    # sees.  Two situations are distinguished, unchanged in their externally
+    # visible behaviour:
     #
     # * the latest verified solve produced the stored table (no marker, e.g.
     #   unknown was later resolved by a fresh feasible solve): normal creation,
@@ -321,46 +329,26 @@ def create_batch(sid: int, req: CreateBatchRequest):
     #   (``use_stored_plan: true``) AND confirms the ORIGINAL thresholds frozen
     #   alongside it; omitting the flag / passing false, or confirming
     #   different thresholds, rejects the request without creating a batch.
-    # Renaming/saving the old table does not clear the marker; a later feasible
-    # solve (or a proven infeasibility) does.
-    if row.get("unverified_solve") is not None:
-        old_R = row["safety_radius"]
-        old_H = row["safety_height"]
-        if not req.use_stored_plan:
-            raise HTTPException(409, detail={
-                "reason": "latest_solve_unverified",
-                "scenario_id": sid,
-                "latest_solve_status": "unknown",
-                "stored_plan_original_safety_radius": old_R,
-                "stored_plan_original_safety_height": old_H,
-                "message": "the most recent solve returned unknown; the stored "
-                           "feasible table is an unverified OLD table. Re-solve "
-                           "successfully first, or explicitly select it with "
-                           "use_stored_plan=true and confirm its original "
-                           "thresholds",
-            })
-        if (req.confirmed_safety_radius is None
-                or req.confirmed_safety_height is None):
-            raise HTTPException(409, detail={
-                "reason": "stored_plan_threshold_confirmation_required",
-                "scenario_id": sid,
-                "stored_plan_original_safety_radius": old_R,
-                "stored_plan_original_safety_height": old_H,
-            })
-        tol = 1e-9
-        if (abs(float(req.confirmed_safety_radius) - float(old_R)) > tol
-                or abs(float(req.confirmed_safety_height) - float(old_H)) > tol):
-            raise HTTPException(409, detail={
-                "reason": "stored_plan_threshold_mismatch",
-                "scenario_id": sid,
-                "stored_plan_original_safety_radius": old_R,
-                "stored_plan_original_safety_height": old_H,
-                "confirmed_safety_radius": req.confirmed_safety_radius,
-                "confirmed_safety_height": req.confirmed_safety_height,
-            })
-    plan = {"offsets": dict(result["offsets"])}
-    bid = store.create_batch(
-        sid, req.name, row["input"], row["safety_radius"], row["safety_height"], plan)
+    #
+    # If the unknown marker commits first, only the explicit + confirmed
+    # selection can create the batch; if the batch transaction commits first it
+    # retains the snapshot that was valid then.  Renaming/saving the old table
+    # does not clear the marker; a later feasible solve (or a proven
+    # infeasibility) does.  Proven infeasibility, absence of any stored table
+    # and a missing scenario keep their 400/404 responses, and refusals leave
+    # no batch behind (the insert is rolled back).
+    try:
+        bid = store.create_guarded_batch(
+            sid, req.name, req.use_stored_plan,
+            req.confirmed_safety_radius, req.confirmed_safety_height)
+    except BatchCreateRejected as exc:
+        # 404/400 keep their historical plain-string bodies; the marker
+        # refusals carry the structured detail dict (reason + fields).
+        if exc.status == 409:
+            detail = {"reason": exc.reason, "scenario_id": sid, **exc.detail}
+        else:
+            detail = exc.reason
+        raise HTTPException(exc.status, detail=detail)
     batch = store.get_batch(bid)
     return _batch_summary(batch)
 

@@ -17,6 +17,14 @@ services:
   # Optional second process sharing the SAME database volume. Start it only
   # for the two-process shared-DB verification (see README):
   #   docker compose --profile multiproc up --build
+  #
+  # DCC_GUARDED_BATCH_DELAY makes THIS process pause briefly just before a
+  # batch-creation write transaction opens. It is a test-only pacing knob
+  # (no effect on the adjudication itself) used by
+  # scripts/verify_multiprocess.py so that a concurrent POST .../solve on the
+  # other process genuinely commits FIRST in some rounds - otherwise a batch
+  # write (a few fast SQL statements) nearly always beats a CP-SAT solve and
+  # the "solve first" interleaving could never be observed over HTTP.
   web2:
     profiles: ["multiproc"]
     image: drone-conflict-console:latest
@@ -28,6 +36,7 @@ services:
       - dcc-data:/data
     environment:
       DCC_DB_PATH: /data/console.db
+      DCC_GUARDED_BATCH_DELAY: "0.15"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health').status==200 else 1)"]

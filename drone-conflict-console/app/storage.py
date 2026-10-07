@@ -8,6 +8,7 @@ reopened and compared against their original input.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -23,6 +24,21 @@ _LOCK = threading.Lock()
 _BUSY_TIMEOUT_MS = 5000
 _BUSY_ATTEMPTS = 60
 _BUSY_WAIT_SECONDS = 0.05
+
+#: Optional pre-transaction delay for cross-process concurrency checks.
+#: Reads ``DCC_GUARDED_BATCH_DELAY`` (seconds); 0/unset means no delay.  When
+#: set on ONE of several server processes sharing the database, that
+#: process's batch creation pauses just BEFORE opening its
+#: ``BEGIN IMMEDIATE`` transaction, giving a concurrent POST .../solve on a
+#: peer a head start so the "solve commits first" interleaving actually shows
+#: up in an HTTP-level race.  (A batch write is otherwise a few fast SQL
+#: statements and almost always beats a CP-SAT solve that must start up and
+#: run.)  The delay is *outside* the write lock, so it cannot block the peer;
+#: once the transaction opens it still waits for the peer to finish and then
+#: reads authoritative state - correctness is unchanged.  Never set in normal
+#: operation.
+def _guarded_batch_pre_delay() -> float:
+    return float(os.environ.get("DCC_GUARDED_BATCH_DELAY", "0") or 0.0)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS scenarios (
@@ -94,6 +110,26 @@ CREATE TABLE IF NOT EXISTS batch_report_nodes (
     UNIQUE (batch_id, seq)
 );
 """
+
+
+class BatchCreateRejected(Exception):
+    """Batch creation refused against the authoritative in-txn state.
+
+    ``status`` is the HTTP status the route must return and ``reason`` the
+    machine-readable code; any extra fields are echoed verbatim inside the
+    response ``detail``.  Raising inside the guarded write transaction rolls
+    the batch insert back, so a refusal never leaves a batch behind.
+    """
+
+    def __init__(self, status: int, reason: str, **detail):
+        super().__init__(reason)
+        self.status = status
+        self.reason = reason
+        self.detail = detail
+
+
+#: The stored plan must be feasible before any batch can freeze it.
+_NO_FEASIBLE_PLAN = "a feasible plan must be solved before creating an execution batch"
 
 
 class Store:
@@ -314,6 +350,102 @@ class Store:
             # Baseline node (seq 1): the empty report state before any
             # accepted write. Created in the same transaction as the batch,
             # so every batch always has a replay chain starting at seq 1.
+            c.execute(
+                "INSERT INTO batch_report_nodes"
+                "(batch_id,seq,trigger_sortie_id,trigger_actual_offset,"
+                "trigger_revision,before_json,after_json,created_at) "
+                "VALUES (?,1,NULL,NULL,NULL,'[]','[]',?)",
+                (bid, now))
+            return bid
+
+    def create_guarded_batch(self, scenario_id: int, name: str,
+                             use_stored_plan: bool,
+                             confirmed_radius: float | None,
+                             confirmed_height: float | None) -> int:
+        """Adjudicate AND insert a batch inside ONE ``BEGIN IMMEDIATE`` txn.
+
+        The whole point is that the eligibility read, the unknown-marker /
+        original-threshold adjudication, the snapshot freeze and the batch
+        insert happen against the *same* committed state, holding SQLite's
+        reserved write lock the entire time.  A concurrent
+        ``save_result`` (a verified feasible/infeasible re-solve) or
+        ``mark_solve_unknown`` from another process therefore commits either
+        strictly before this transaction's authoritative read (the batch is
+        then decided on the NEW state) or strictly after its commit (the
+        batch keeps the snapshot that was valid at decision time) - the
+        stale "read the old table/marker outside a write txn, insert in a
+        later txn" window no longer exists:
+
+        * an ``unknown`` marker committed first is seen here, so a request
+          that did not select the retained old table (or fails the original
+          threshold confirmation) is rejected with no batch;
+        * a new verified solve committed first is seen here too, so the
+          batch freezes the NEW table/thresholds rather than a stale old
+          table fetched outside the transaction.
+
+        Raises :class:`BatchCreateRejected` (404 scenario missing, 400 no
+        feasible table, 409 marker-related) and rolls back; returns the new
+        batch id on success.
+        """
+        tol = 1e-9
+
+        def reject(status, reason, **detail):
+            raise BatchCreateRejected(status, reason, **detail)
+
+        # Optional, env-gated pacing delay for the cross-process verification
+        # script (see ``_guarded_batch_pre_delay``); 0 in normal operation.
+        pre_delay = _guarded_batch_pre_delay()
+        if pre_delay > 0:
+            time.sleep(pre_delay)
+
+        with self._write_tx() as c:
+            row = c.execute("SELECT * FROM scenarios WHERE id=?",
+                            (scenario_id,)).fetchone()
+            if row is None:
+                reject(404, "scenario not found")
+            input_payload = json.loads(row["input_json"])
+            result = json.loads(row["result_json"]) if row["result_json"] else None
+            old_R, old_H = row["safety_radius"], row["safety_height"]
+            if result is None or not result.get("feasible"):
+                reject(400, _NO_FEASIBLE_PLAN)
+            if row["latest_solve_status"] is not None:
+                # The persisted unknown marker is authoritative AT THIS
+                # SNAPSHOT - it can no longer arrive in the gap between the
+                # route's read and the insert (any such write waits on this
+                # transaction and is adjudicated by a LATER request).
+                if not use_stored_plan:
+                    reject(409, "latest_solve_unverified",
+                           latest_solve_status="unknown",
+                           stored_plan_original_safety_radius=old_R,
+                           stored_plan_original_safety_height=old_H,
+                           message="the most recent solve returned unknown; the "
+                                   "stored feasible table is an unverified OLD "
+                                   "table. Re-solve successfully first, or "
+                                   "explicitly select it with use_stored_plan=true "
+                                   "and confirm its original thresholds")
+                if confirmed_radius is None or confirmed_height is None:
+                    reject(409, "stored_plan_threshold_confirmation_required",
+                           stored_plan_original_safety_radius=old_R,
+                           stored_plan_original_safety_height=old_H)
+                if (abs(float(confirmed_radius) - float(old_R)) > tol
+                        or abs(float(confirmed_height) - float(old_H)) > tol):
+                    reject(409, "stored_plan_threshold_mismatch",
+                           stored_plan_original_safety_radius=old_R,
+                           stored_plan_original_safety_height=old_H,
+                           confirmed_safety_radius=confirmed_radius,
+                           confirmed_safety_height=confirmed_height)
+            # Freeze exactly the state read inside this transaction; a peer
+            # write that commits afterwards belongs to later requests/batches.
+            plan = {"offsets": dict(result["offsets"])}
+            now = time.time()
+            cur = c.execute(
+                "INSERT INTO batches(scenario_id,name,input_json,safety_radius,"
+                "safety_height,plan_json,created_at) VALUES (?,?,?,?,?,?,?)",
+                (scenario_id, name, json.dumps(input_payload, ensure_ascii=False),
+                 float(old_R), float(old_H),
+                 json.dumps(plan, ensure_ascii=False), now),
+            )
+            bid = int(cur.lastrowid)
             c.execute(
                 "INSERT INTO batch_report_nodes"
                 "(batch_id,seq,trigger_sortie_id,trigger_actual_offset,"

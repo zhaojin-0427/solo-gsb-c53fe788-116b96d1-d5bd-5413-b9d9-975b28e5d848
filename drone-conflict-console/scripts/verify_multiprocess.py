@@ -26,6 +26,20 @@ batches and then exercises the revision protocol *across the two processes*:
   processes; the node's before/after snapshots replay to the stored state and
   a review reloaded from either process returns identical first-conflict
   deltas; an unknown node returns 404.
+* batch-vs-solve interleaving: POST .../batches is fired from one process at
+  the same instant POST .../solve is fired from the OTHER process against the
+  SAME shared SQLite file.  However the write transactions serialize, the
+  observed result must be a valid linearization:
+  - against a timed-out ``unknown`` solve (retained OLD table): either the
+    batch commits first (201 freezing the old table, and a LATER unflagged
+    request is then refused 409) or the unknown marker commits first
+    (the unflagged batch is refused 409 ``latest_solve_unverified`` and NO
+    batch is created; only ``use_stored_plan:true`` + the ORIGINAL thresholds
+    still creates it); the forbidden stale outcome - 201 on a request whose
+    decision predated a marker committed ahead of its insert - never appears;
+  - against a verified feasible re-solve under a lock: the frozen batch is
+    ALWAYS one internally consistent snapshot (either the old offsets at the
+    old thresholds or the new offsets at the new thresholds, never mixed).
 
 After every case it reloads the batch (and its warning) from BOTH processes
 and checks they show the highest revision's actual offset. Exits non-zero on
@@ -136,6 +150,269 @@ def report_nodes(base, bid):
 def review(base, bid, node_id, t):
     return call("GET", base,
                 f"/api/batches/{bid}/report-nodes/{node_id}/review?t={t}")
+
+
+def batches(base, sid=None):
+    path = "/api/batches" + (f"?scenario_id={sid}" if sid is not None else "")
+    status, body = call("GET", base, path)
+    assert status == 200, (status, body)
+    return body["batches"]
+
+
+def solve(base, sid, payload):
+    return call("POST", base, f"/api/scenarios/{sid}/solve", payload)
+
+
+def create_batch_async(pool, base, sid, body=None):
+    """Fire a batch creation; return (future, release_barrier).
+
+    The caller passes the same barrier to a concurrent solve future so both
+    HTTP requests are released at the same instant.
+    """
+    start = threading.Barrier(2)
+
+    def go():
+        start.wait()
+        return call("POST", base, f"/api/scenarios/{sid}/batches",
+                    body if body is not None else {"name": "race-batch"})
+
+    return pool.submit(go), start
+
+
+# BASE2 runs with DCC_GUARDED_BATCH_DELAY set (see README / docker-compose):
+# its batch write pauses just BEFORE opening the write transaction, so a solve
+# fired concurrently from BASE1 commits first.  Batches sent to BASE1 are
+# undelayed and normally commit first.  Alternating per round exercises both
+# real serialization orders deterministically.
+DELAYED, FAST = BASE2, BASE1
+
+
+def _race_bases(trial):
+    """Return (batch_base, solve_base) with the two processes opposed.
+
+    Even rounds put the batch on the DELAYED process (the solve on the fast
+    peer commits first); odd rounds put it on the FAST process (the batch
+    commits first).
+    """
+    if trial % 2 == 0:
+        return DELAYED, FAST
+    return FAST, DELAYED
+
+
+def batch_vs_solve_unknown_checks(pool):
+    """Unflagged batch racing an unknown solve that retains an OLD table.
+
+    Even rounds fire the batch from the DELAYED process (the unknown marker
+    commits first); odd rounds fire it from the FAST process (the batch
+    commits first).
+    """
+    payload = json.loads((ROOT / "examples" / "crossroads.json").read_text())
+    old_offsets = {"UAV-A": 4, "UAV-B": 0, "UAV-C": 2, "UAV-D": 6}
+    unknown_req = {"time_limit": 0.0001, "safety_radius": 45,
+                   "safety_height": 12,
+                   "locks": [{"sortie_id": "UAV-B", "offset": 5}]}
+    orders = {"batch_first": 0, "unknown_first": 0}
+    rounds = 10
+    for trial in range(rounds):
+        batch_base, solve_base = _race_bases(trial)
+        status, body = call("POST", BASE1, "/api/import", payload)
+        assert status == 200, (status, body)
+        sid = body["scenario_id"]
+        status, body = solve(BASE1, sid, {"time_limit": 20})
+        assert status == 200 and body["solution"]["feasible"], (status, body)
+        assert batches(BASE1, sid) == []
+
+        bf, barrier = create_batch_async(pool, batch_base, sid)
+
+        def solve_go():
+            barrier.wait()
+            return solve(solve_base, sid, unknown_req)
+
+        sf = pool.submit(solve_go)
+        bstatus, bbody = bf.result()
+        sstatus, sbody = sf.result()
+        check(sstatus == 200 and sbody["solution"]["status"] == "unknown",
+              f"U{trial}: peer solve is unknown (HTTP {sstatus})")
+        rows = batches(BASE1, sid)
+        _, mbody = call("GET", BASE1, f"/api/scenarios/{sid}")
+        has_marker = mbody.get("unverified_solve") is not None
+        if bstatus == 201:
+            orders["batch_first"] += 1
+            check(batch_base == FAST,
+                  f"U{trial}: 201 only from the undelayed (batch-first) side")
+            # The batch legitimately serialized BEFORE the marker: it freezes
+            # the old snapshot, and the marker only governs later requests.
+            check(has_marker and len(rows) == 1
+                  and bbody["planned_offsets"] == old_offsets
+                  and bbody["safety_radius"] == 30
+                  and bbody["safety_height"] == 10,
+                  f"U{trial}: batch-first freezes old table 30/10 -> {bbody}")
+            status2, body2 = call("POST", BASE2, f"/api/scenarios/{sid}/batches",
+                                  {"name": "after"})
+            check(status2 == 409
+                  and body2["detail"]["reason"] == "latest_solve_unverified",
+                  f"U{trial}: later unflagged batch refused 409 (got {status2})")
+            check(len(batches(BASE1, sid)) == 1,
+                  f"U{trial}: refusal created no extra batch")
+            # Explicit old-table selection with original thresholds still works.
+            status2, body2 = call(
+                "POST", BASE1, f"/api/scenarios/{sid}/batches",
+                {"name": "explicit", "use_stored_plan": True,
+                 "confirmed_safety_radius": 30,
+                 "confirmed_safety_height": 10})
+            check(status2 == 201 and body2["planned_offsets"] == old_offsets,
+                  f"U{trial}: explicit confirmed old-table batch 201 (got {status2})")
+        else:
+            orders["unknown_first"] += 1
+            check(batch_base == DELAYED,
+                  f"U{trial}: refusal expected from the delayed (marker-first) "
+                  f"side, got {bstatus}")
+            # The marker committed ahead of the batch decision: the unflagged
+            # request MUST be refused and leave no batch (the stale-release
+            # bug would have returned 201 here).
+            check(bstatus == 409
+                  and bbody["detail"]["reason"] == "latest_solve_unverified"
+                  and has_marker and rows == [],
+                  f"U{trial}: unknown-first refuses unflagged batch, no row "
+                  f"-> {bstatus} {bbody}, rows={rows}")
+            # New attempted thresholds confirmed -> mismatch, still no batch.
+            status2, body2 = call(
+                "POST", BASE2, f"/api/scenarios/{sid}/batches",
+                {"use_stored_plan": True,
+                 "confirmed_safety_radius": 45,
+                 "confirmed_safety_height": 12})
+            check(status2 == 409
+                  and body2["detail"]["reason"] == "stored_plan_threshold_mismatch"
+                  and batches(BASE1, sid) == [],
+                  f"U{trial}: mismatch confirmation refused, no row (got {status2})")
+    print(f"  (batch vs unknown over {rounds} rounds: "
+          f"batch-first={orders['batch_first']}, "
+          f"unknown-first={orders['unknown_first']})")
+    check(orders["batch_first"] > 0 and orders["unknown_first"] > 0,
+          "batch-vs-unknown: both real commit orders were exercised")
+
+
+def batch_vs_feasible_checks(pool):
+    """Unflagged batch racing a verified feasible re-solve with new offsets."""
+    payload = json.loads((ROOT / "examples" / "crossroads.json").read_text())
+    old_offsets = {"UAV-A": 4, "UAV-B": 0, "UAV-C": 2, "UAV-D": 6}
+    new_offsets = {"UAV-A": 4, "UAV-B": 5, "UAV-C": 10, "UAV-D": 11}
+    # New verified solve: keep the ORIGINAL thresholds but lock UAV-B=5; this
+    # is proven optimal quickly and changes the planned offsets.
+    locked_req = {"time_limit": 20,
+                  "locks": [{"sortie_id": "UAV-B", "offset": 5}]}
+    orders = {"old_snapshot": 0, "new_snapshot": 0}
+    rounds = 10
+    for trial in range(rounds):
+        batch_base, solve_base = _race_bases(trial)
+        status, body = call("POST", BASE1, "/api/import", payload)
+        assert status == 200, (status, body)
+        sid = body["scenario_id"]
+        status, body = solve(BASE1, sid, {"time_limit": 20})
+        assert status == 200 and body["solution"]["feasible"], (status, body)
+        assert batches(BASE1, sid) == []
+
+        bf, barrier = create_batch_async(pool, batch_base, sid)
+
+        def solve_go():
+            barrier.wait()
+            return solve(solve_base, sid, locked_req)
+
+        sf = pool.submit(solve_go)
+        bstatus, bbody = bf.result()
+        sstatus, sbody = sf.result()
+        check(sstatus == 200 and sbody["solution"]["feasible"]
+              and sbody["solution"]["offsets"] == new_offsets,
+              f"F{trial}: peer solve is the new feasible table (HTTP {sstatus})")
+        check(bstatus == 201, f"F{trial}: batch created (HTTP {bstatus})")
+        rows = batches(BASE1, sid)
+        check(len(rows) == 1, f"F{trial}: exactly one batch, got {rows}")
+        # Whichever transaction won, the frozen batch must be ONE consistent
+        # committed snapshot (offsets and thresholds read together in-txn),
+        # never a mixed freeze.
+        offs = bbody["planned_offsets"]
+        R, H = bbody["safety_radius"], bbody["safety_height"]
+        if offs == old_offsets:
+            orders["old_snapshot"] += 1
+            check(batch_base == FAST and (R, H) == (30, 10),
+                  f"F{trial}: old offsets frozen WITH old thresholds on the "
+                  f"batch-first side, got {R}/{H}/{batch_base}")
+        elif offs == new_offsets:
+            orders["new_snapshot"] += 1
+            check(batch_base == DELAYED and (R, H) == (30, 10),
+                  f"F{trial}: solve-first side freezes the new locked offsets "
+                  f"(thresholds stay 30/10), got {R}/{H}/{batch_base}")
+        else:
+            check(False, f"F{trial}: impossible offsets snapshot {offs}")
+        # The frozen batch is visible identically from BOTH processes.
+        got = {b["id"]: b for b in batches(BASE2, sid)}
+        check(bbody["batch_id"] in got, f"F{trial}: batch visible via BASE2")
+    print(f"  (batch vs feasible over {rounds} rounds: "
+          f"batch-first(old)={orders['old_snapshot']}, "
+          f"solve-first(new)={orders['new_snapshot']})")
+    check(orders["old_snapshot"] > 0 and orders["new_snapshot"] > 0,
+          "batch-vs-feasible: both real commit orders were exercised")
+
+
+def batch_vs_rethreshold_checks(pool):
+    """Batch racing a feasible re-solve under NEW, SMALLER thresholds.
+
+    Smaller safety parameters relax constraints; the lexicographic optimum
+    shifts to DIFFERENT offsets AND the stored thresholds change, so a stale
+    freeze would surface as an impossible (new offsets, old thresholds) /
+    (old offsets, new thresholds) mix.  Every round uses a fresh import so the
+    "before" table is deterministically the original 30/10 optimum.
+    """
+    payload = json.loads((ROOT / "examples" / "crossroads.json").read_text())
+    old_offsets = {"UAV-A": 4, "UAV-B": 0, "UAV-C": 2, "UAV-D": 6}
+    new_offsets = {"UAV-A": 0, "UAV-B": 0, "UAV-C": 0, "UAV-D": 0}
+    reth = {"time_limit": 20, "safety_radius": 15, "safety_height": 5}
+    orders = {"old": 0, "new": 0}
+    rounds = 10
+    for trial in range(rounds):
+        batch_base, solve_base = _race_bases(trial)
+        status, body = call("POST", BASE1, "/api/import", payload)
+        assert status == 200, (status, body)
+        sid = body["scenario_id"]
+        status, body = solve(BASE1, sid, {"time_limit": 20})
+        assert status == 200 and body["solution"]["feasible"]
+        assert body["solution"]["offsets"] == old_offsets, body
+
+        bf, barrier = create_batch_async(pool, batch_base, sid)
+
+        def solve_go():
+            barrier.wait()
+            return solve(solve_base, sid, reth)
+
+        sf = pool.submit(solve_go)
+        bstatus, bbody = bf.result()
+        sstatus, sbody = sf.result()
+        check(sstatus == 200 and sbody["solution"]["feasible"]
+              and sbody["solution"]["offsets"] == new_offsets,
+              f"T{trial}: re-threshold solve gives the all-zero table "
+              f"(HTTP {sstatus} {sbody.get('solution', {}).get('offsets')})")
+        check(bstatus == 201 and len(batches(BASE1, sid)) == 1,
+              f"T{trial}: one batch created (HTTP {bstatus})")
+        offs = bbody["planned_offsets"]
+        R, H = bbody["safety_radius"], bbody["safety_height"]
+        # Offsets and thresholds must always come from the SAME committed read,
+        # and the winning side must match the forced ordering.
+        if (offs, R, H) == (old_offsets, 30, 10):
+            orders["old"] += 1
+            check(batch_base == FAST,
+                  f"T{trial}: old snapshot only from the batch-first side")
+        elif (offs, R, H) == (new_offsets, 15, 5):
+            orders["new"] += 1
+            check(batch_base == DELAYED,
+                  f"T{trial}: new snapshot only from the solve-first side")
+        else:
+            check(False, f"T{trial}: impossible mixed snapshot "
+                         f"offsets={offs} R={R} H={H}")
+    print(f"  (batch vs re-threshold over {rounds} rounds: "
+          f"batch-first(old 30/10)={orders['old']}, "
+          f"solve-first(new 15/5)={orders['new']})")
+    check(orders["old"] > 0 and orders["new"] > 0,
+          "re-threshold: both consistent snapshot orders were observed")
 
 
 def race(bid, offers):
@@ -310,6 +587,18 @@ def main():
     check(status == 404, f"unknown review node -> 404 (got {status})")
     status, _ = call("GET", BASE1, "/api/batches/999999/report-nodes")
     check(status == 404, f"unknown batch node list -> 404 (got {status})")
+
+    # --- batch creation vs concurrent /solve across the two processes ------
+    # The batch decision and snapshot freeze run in ONE BEGIN IMMEDIATE
+    # transaction, so whichever of batch/solve commits first is exactly what
+    # the other side sees; no stale "read outside, insert later" 201.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        print("-- batch vs UNKNOWN solve (old table retained) --")
+        batch_vs_solve_unknown_checks(pool)
+        print("-- batch vs verified feasible locked re-solve --")
+        batch_vs_feasible_checks(pool)
+        print("-- batch vs feasible re-solve with NEW thresholds --")
+        batch_vs_rethreshold_checks(pool)
 
     print()
     if FAILURES:
